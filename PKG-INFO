@@ -1,0 +1,108 @@
+Metadata-Version: 1.0
+Name: overload
+Version: 1.1
+Summary: simple provision of method overloading
+Home-page: http://pypi.python.org/pypi/overload
+Author: Richard Jones
+Author-email: richard@python.org
+License: UNKNOWN
+Description: Simple overloading of functions through an @overload decorator.
+        
+        This module allows one to provide multiple interfaces for a functions,
+        methods, classmethods, staticmethods or classes. See below for some notes
+        about overloading classes, you strange person you.
+        
+        The appropriate implementation is chosen based on the calling argument
+        pattern.
+        
+        For example:
+        
+        >>> class A(object):
+        ...   @overload
+        ...   def method(self, a):
+        ...     return 'a'
+        ...   @method.add
+        ...   def method(self, a, b):
+        ...     return 'a, b'
+        ... 
+        >>> a = A()
+        >>> a.method(1)
+        'a'
+        >>> a.method(1, 2)
+        'a, b'
+        
+        The overloading handles fixed, keyword, variable (``*args``) and arbitrary
+        keyword (``**keywords``) arguments.
+        
+        It also handles annotations if those annotations are types:
+        
+        >>> @overload
+        ... def func(a:int):
+        ...   return 'int'
+        ... 
+        >>> @func.add
+        ... def func(a:str):
+        ...   return 'str'
+        ... 
+        >>> func(1)
+        'int'
+        >>> func('s')
+        'str'
+        >>> func(1.0)
+        Traceback (most recent call last):
+          File "<stdin>", line 1, in <module>
+          File "overload.py", line 94, in f
+            raise TypeError('invalid call argument(s)')
+        TypeError: invalid call argument(s)
+        
+        This feature (and currently the module in general) requires Python 3.
+        
+        The docstring and name (ie. documentation) of the resultant callable will
+        match that of the *first* callable overloaded.
+        
+        
+        Overloading Classes
+        --------------------
+        
+        Overloading classes allows you to select a class type based on the
+        construction arguments of each alternative type's __new__ method.
+        
+        There's a catch though: the __new__ method must *explicitly* invoke the
+        base class __new__ method, rather than use super() like usual. This is
+        because after being @overloaded the class is a function, and super()
+        doesn't like being passed functions. So instead of::
+        
+            @overload
+            class A(object):
+                def __new__(cls):
+                    # this will fail because "A" is a function now
+                    return super(A, cls).__new__(cls)
+        
+        you must::
+        
+            @overload
+            class A(object):
+                def __new__(cls):
+                    # must explicitly reference the base class
+                    return object.__new__(cls)
+        
+        I'll leave it up to the reader to justify their use of @overloading
+        classes.
+        
+        
+        Version History (in Brief)
+        --------------------------
+        
+        - 1.1 altered the text of the invalid call TypeError. Removed debug prints.
+        - 1.0 the initial release
+        
+        See the end of the source file for the license of use.
+        
+Platform: UNKNOWN
+Classifier: Environment :: Web Environment
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Software Development :: Code Generators
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Topic :: Text Processing :: Markup :: HTML
+Classifier: License :: OSI Approved :: BSD License
