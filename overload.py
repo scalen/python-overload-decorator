@@ -85,10 +85,12 @@ classes.
 Version History (in Brief)
 --------------------------
 
-- 1.2 Simplified `f()` by distinguishing between definition function and
-      implementation to call at decoration time.
-- 1.1 altered the text of the invalid call TypeError. Removed debug prints.
-- 1.0 the initial release
+- 1.2.1 Fixed the case where the first defaulted arg is specified, but the
+        second is not (previously used the first default value).
+- 1.2.0 Simplified `f()` by distinguishing between definition function and
+        implementation to call at decoration time.
+- 1.1.0 altered the text of the invalid call TypeError. Removed debug prints.
+- 1.0.0 the initial release
 
 See the end of the source file for the license of use.
 '''
@@ -113,14 +115,13 @@ def overload(callable):
             # duplicate the arguments provided so we may consume them
             _args = list(args)
             _kw = dict(kw)
-            if definition.__defaults__:
-                _defaults = list(definition.__defaults__)
-            else:
-                _defaults = []
 
+            default_count = len(definition.__defaults__) if definition.__defaults__ else 0
+            first_default_index = definition.__code__.co_argcount - default_count
             usable_args = []
             for n in range(definition.__code__.co_argcount):
                 arg = definition.__code__.co_varnames[n]
+                default_index = n - first_default_index
 
                 # unlike instance methods, class methods don't appear
                 # to have the class passed in as the first arg, so skip
@@ -133,8 +134,8 @@ def overload(callable):
                     value = _args.pop(0)
                 elif arg in _kw:
                     value = _kw.pop(arg)
-                elif _defaults:
-                    value = _defaults.pop(0)
+                elif default_index >= 0:
+                    value = definition.__defaults__[default_index]
                 else:
                     break
 
@@ -365,7 +366,20 @@ class TestOverload(unittest.TestCase):
 
         self.assertEqual(func(1), 'a')
         self.assertEqual(func(a=1), 'a')
-        self.assertEqual(func(c=1, b=2), '**kw 1')
+        self.assertEqual(func(c=1, a=2), '**kw 1')
+
+    def test_kw_mixed3(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @func.add
+        def func(a=1, b=2, c=3, **kw):
+            return 'a {a}, b {b}, c {c}, **kw {count}'.format(a=a, b=b, c=c, count=len(kw))
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(a=1), 'a')
+        self.assertEqual(func(a=4, c=5, d=0), 'a 4, b 2, c 5, **kw 1')
 
 if __name__ == '__main__':
     unittest.main()
