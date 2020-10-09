@@ -85,6 +85,8 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 1.2 Simplified `f()` by distinguishing between definition function and
+      implementation to call at decoration time.
 - 1.1 altered the text of the invalid call TypeError. Removed debug prints.
 - 1.0 the initial release
 
@@ -95,6 +97,7 @@ __version__ = '1.1'
 import functools
 import types
 import unittest
+from typing import List, Tuple
 
 def overload(callable):
     '''Allow overloading of a callable.
@@ -102,42 +105,27 @@ def overload(callable):
     Invoke the result of this call with .add() to add additional
     implementations.
     '''
-    callables = [callable]
-
-    # sanity check
-    if isinstance(callable, type):
-        if not isinstance(callable.__new__, types.FunctionType):
-            raise TypeError('overloaded class requires __new__ implementation')
+    implementations: List[Tuple] = []
 
     @functools.wraps(callable)
     def f(*args, **kw):
-        for callable in callables:
-            # if the callable is a class then look for __new__ variations
-            if isinstance(callable, type):
-                func = callable.__new__
-            elif (isinstance(callable, classmethod) or
-                    isinstance(callable, staticmethod)):
-                func = callable.__get__(callable.__class__)
-            else:
-                func = callable
-
+        for definition, implementation, skip_first_arg in implementations:
             # duplicate the arguments provided so we may consume them
             _args = list(args)
             _kw = dict(kw)
-            if func.__defaults__:
-                _defaults = list(func.__defaults__)
+            if definition.__defaults__:
+                _defaults = list(definition.__defaults__)
             else:
                 _defaults = []
 
             usable_args = []
-            for n in range(func.__code__.co_argcount):
-                arg = func.__code__.co_varnames[n]
+            for n in range(definition.__code__.co_argcount):
+                arg = definition.__code__.co_varnames[n]
 
                 # unlike instance methods, class methods don't appear
                 # to have the class passed in as the first arg, so skip
                 # filling the first argument
-                if n == 0 and (isinstance(callable, type)
-                        or isinstance(callable, classmethod)):
+                if n == 0 and skip_first_arg:
                     continue
 
                 # attempt to fill this argument
@@ -151,7 +139,7 @@ def overload(callable):
                     break
 
                 # check annotation if it's a type
-                ann = func.__annotations__.get(arg)
+                ann = definition.__annotations__.get(arg)
                 if isinstance(ann, type) and not isinstance(value, ann):
                     break
 
@@ -159,35 +147,47 @@ def overload(callable):
             else:
                 # check whether any supplied arguments remain
                 if _args:
-                    if  func.__code__.co_flags & 0x04:
+                    if  definition.__code__.co_flags & 0x04:
                         # use as varargs
                         usable_args.extend(_args)
                     else:
                         continue
                 if _kw:
                     # use as arbitrary keyword args?
-                    if not func.__code__.co_flags & 0x08:
+                    if not definition.__code__.co_flags & 0x08:
                         continue
 
                 # attempt to invoke the callable
-                if (isinstance(callable, classmethod) or
-                        isinstance(callable, staticmethod)):
-                    # yet another variation - actually call the method
-                    # underlying the classmethod directly - the proxyish
-                    # object we've received as func has the class first
-                    # param filled in...
-                    return func(*usable_args, **_kw)
-                else:
-                    return callable(*usable_args, **_kw)
+                return implementation(*usable_args, **_kw)
 
         # this error message probably can't get any better :-)
         raise TypeError('invalid call argument(s)')
 
     # allow adding of additional implementations
     def add(callable):
-        callables.append(callable)
+        skip_first_arg = isinstance(callable, classmethod)
+
+        # if the callable is a class then look for __new__ variations
+        if isinstance(callable, type):
+            # sanity check
+            if not isinstance(callable.__new__, types.FunctionType):
+                raise TypeError('overloaded class requires __new__ implementation')
+            definition = callable.__new__
+            implementation = callable
+            skip_first_arg = True
+        elif isinstance(callable, classmethod) or isinstance(callable, staticmethod):
+            # actually call the method underlying the classmethod directly - the proxyish
+            # object we've received as callable has the class first param filled in...
+            definition = implementation = callable.__get__(callable.__class__)
+        else:
+            definition = implementation = callable
+
+        implementations.append((definition, implementation, skip_first_arg))
+
         return f
     f.add = add
+
+    f.add(callable)
 
     return f
 
