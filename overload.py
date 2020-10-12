@@ -85,6 +85,7 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 1.3.0 Add support for positional- and keyword-only arguments
 - 1.2.2 Grand refactor to separate the different kinds of logic:
         * Determining the kind of callable;
         * Parsing callable signature into readable/useable variables;
@@ -116,6 +117,7 @@ class _Undefined:
 
 _ParamAnnotatedType = Union[type, _Undefined]
 _PositionalParamDefinition = Tuple[int, str, _ParamAnnotatedType, Any]
+_KeywordParamDefinition = Tuple[str, _ParamAnnotatedType, Any]
 
 
 class Signature:
@@ -156,6 +158,17 @@ class Signature:
         else:
             return self.undefined
 
+    def _get_keyword_default(self, parameter: str) -> Any:
+        keyword_only_defaults = getattr(self._callable, "__kwdefaults__", None) or {}
+        if parameter in keyword_only_defaults:
+            return keyword_only_defaults[parameter]
+        else:
+            return self.undefined
+
+    @property
+    def _positional_only_parameters_count(self) -> int:
+        return getattr(self._callable.__code__, "co_posonlyargcount", None) or 0
+
     @property
     def _positional_parameters(self) -> Sequence[_PositionalParamDefinition]:
         # unlike instance methods, class methods don't appear to have the class passed in as the
@@ -167,6 +180,23 @@ class Signature:
             for n, param in enumerate(
                 self._callable.__code__.co_varnames[positional_parameters_slice], start=start
             )
+        )
+
+    @property
+    def _keyword_only_parameters(self) -> Sequence[_KeywordParamDefinition]:
+        keyword_only_parameter_count = (
+            getattr(self._callable.__code__, "co_kwonlyargcount", None) or 0
+        )
+        if not keyword_only_parameter_count:
+            return ()
+
+        keyword_only_parameters_slice = slice(
+            self._callable.__code__.co_argcount,
+            self._callable.__code__.co_argcount + keyword_only_parameter_count,
+        )
+        return tuple(
+            (param, self._get_param_type(param), self._get_keyword_default(param))
+            for param in self._callable.__code__.co_varnames[keyword_only_parameters_slice]
         )
 
     def validate(self, *args, **kwargs) -> bool:
@@ -183,6 +213,9 @@ class Signature:
                 value = _args.pop(0)
             elif param in _kw:
                 # Arg provided as kwarg
+                if index < self._positional_only_parameters_count:
+                    # Positional-only arg specified in kwargs
+                    return False
                 value = _kw.pop(param)
             elif default is self.undefined:
                 # No value for non-defaulted arg
@@ -194,6 +227,17 @@ class Signature:
 
             if param_type is not self.undefined and not isinstance(value, param_type):
                 # Arg is not of expected type
+                return False
+
+        # validate remaining kwargs against keyword-only arguments
+        for param, param_type, default in self._keyword_only_parameters:
+            if param in _kw:
+                value = _kw.pop(param)
+                if param_type is not self.undefined and not isinstance(value, param_type):
+                    # Keyword-only arg is not of expected type
+                    return False
+            elif default is self.undefined:
+                # No value for non-defaulted keyword-only arg
                 return False
 
         # validate remaining varargs/-kwargs
@@ -337,6 +381,18 @@ class TestOverload(unittest.TestCase):
         self.assertRaises(TypeError, func, 'a', 'b', 'c')
         self.assertRaises(TypeError, func, b=1)
 
+    def test_positional_only_args(self):
+        @overload
+        def func(a, /, b):
+            return 'with b and positional-only a'
+
+        @func.add
+        def func(a, b):
+            return 'with a and b'
+
+        self.assertEqual(func('a', b='b'), 'with b and positional-only a')
+        self.assertEqual(func(a='a', b='b'), 'with a and b')
+
     def test_overload_independent(self):
         class A(object):
             @overload
@@ -417,6 +473,18 @@ class TestOverload(unittest.TestCase):
         self.assertEqual(func(1), 'a')
         self.assertEqual(func(a=1), 'a')
         self.assertEqual(func(a=1, b=2), '**kw 2')
+
+    def test_kw_only_args(self):
+        @overload
+        def func(a, *, b):
+            return 'with a and keyword only b'
+
+        @func.add
+        def func(a, b):
+            return 'with a and b'
+
+        self.assertEqual(func(1, 2), 'with a and b')
+        self.assertEqual(func(a=1, b=2), 'with a and keyword only b')
 
     def test_kw_types(self):
         @overload
