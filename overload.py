@@ -85,7 +85,9 @@ classes.
 Version History (in Brief)
 --------------------------
 
-- 1.3.0 Add support for positional- and keyword-only arguments
+- 1.3.1 Improve type annotation support with stringed types and forward
+        references.
+- 1.3.0 Add support for positional- and keyword-only arguments.
 - 1.2.2 Grand refactor to separate the different kinds of logic:
         * Determining the kind of callable;
         * Parsing callable signature into readable/useable variables;
@@ -105,7 +107,7 @@ __version__ = '1.1'
 import functools
 import types
 import unittest
-from typing import Any, Callable, List, Sequence, Tuple, Union
+from typing import get_type_hints, Any, Callable, List, Sequence, Tuple, Union
 
 
 class _Undefined:
@@ -142,7 +144,7 @@ class Signature:
             self._callable = self.implementation = f.__get__(f.__class__)
 
     def _get_param_type(self, param: str) -> _ParamAnnotatedType:
-        annotations = getattr(self._callable, "__annotations__", None) or {}
+        annotations = get_type_hints(self._callable)
         if param not in annotations:
             return self.undefined
         annotation = annotations[param]
@@ -416,8 +418,13 @@ class TestOverload(unittest.TestCase):
         def func(a:str):
             return 'str'
 
+        @func.add
+        def func(a:Union[dict, list]):
+            return 'dict or list'
+
         self.assertEqual(func(1), 'int')
         self.assertEqual(func('1'), 'str')
+        self.assertEqual(func({}), 'dict or list')
 
     def test_varargs(self):
         @overload
