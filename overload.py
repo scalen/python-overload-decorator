@@ -85,6 +85,11 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 1.2.2 Grand refactor to separate the different kinds of logic:
+        * Determining the kind of callable;
+        * Parsing callable signature into readable/useable variables;
+        * Validating arguments against a signature;
+        * Multiple dispatch over multiple signatures.
 - 1.2.1 Fixed the case where the first defaulted arg is specified, but the
         second is not (previously used the first default value).
 - 1.2.0 Simplified `f()` by distinguishing between definition function and
@@ -99,7 +104,122 @@ __version__ = '1.1'
 import functools
 import types
 import unittest
-from typing import List, Tuple
+from typing import Any, Callable, List, Sequence, Tuple, Union
+
+
+class _Undefined:
+    def __bool__(self):
+        return False
+    def __nonzero__(self):
+        return False
+
+
+_ParamAnnotatedType = Union[type, _Undefined]
+_PositionalParamDefinition = Tuple[int, str, _ParamAnnotatedType, Any]
+
+
+class Signature:
+    '''Wraps a callable to directly expose its signature.'''
+    undefined = _Undefined()
+
+    def __init__(self, f: Callable, /):
+        self._callable: Callable = f
+        self.implementation: Callable = f
+        self._skip_first_arg: bool = isinstance(f, classmethod)
+
+        # if the callable is a class then look for __new__ variations
+        if isinstance(f, type):
+            # sanity check
+            if not isinstance(f.__new__, types.FunctionType):
+                raise TypeError('overloaded class requires __new__ implementation')
+            self._callable = f.__new__
+            self._skip_first_arg = True
+        elif isinstance(f, classmethod) or isinstance(f, staticmethod):
+            # actually call the method underlying the classmethod directly - the proxyish
+            # object we've received as f has the class first param filled in...
+            self._callable = self.implementation = f.__get__(f.__class__)
+
+    def _get_param_type(self, param: str) -> _ParamAnnotatedType:
+        annotations = getattr(self._callable, "__annotations__", None) or {}
+        if param not in annotations:
+            return self.undefined
+        annotation = annotations[param]
+        return annotation if isinstance(annotation, type) else self.undefined
+
+    def _get_positional_default(self, position: int) -> Any:
+        if not self._callable.__defaults__:
+            return self.undefined
+        default_count = len(self._callable.__defaults__)
+        index = position - self._callable.__code__.co_argcount + default_count
+        if 0 <= index < default_count:
+            return self._callable.__defaults__[index]
+        else:
+            return self.undefined
+
+    @property
+    def _positional_parameters(self) -> Sequence[_PositionalParamDefinition]:
+        # unlike instance methods, class methods don't appear to have the class passed in as the
+        # first arg, so skip filling the first argument
+        start = 1 if self._skip_first_arg else 0
+        positional_parameters_slice = slice(start, self._callable.__code__.co_argcount)
+        return tuple(
+            (n, param, self._get_param_type(param), self._get_positional_default(n))
+            for n, param in enumerate(
+                self._callable.__code__.co_varnames[positional_parameters_slice], start=start
+            )
+        )
+
+    def validate(self, *args, **kwargs) -> bool:
+        # duplicate the arguments provided so we may consume them
+        _args = list(args)
+        _kw = dict(kwargs)
+
+        # validate args (and kwargs, where specified for positional parameters
+        for index, param, param_type, default in self._positional_parameters:
+            if _args:
+                if param in _kw:
+                    # Arg specified in both args and kwargs
+                    return False
+                value = _args.pop(0)
+            elif param in _kw:
+                # Arg provided as kwarg
+                value = _kw.pop(param)
+            elif default is self.undefined:
+                # No value for non-defaulted arg
+                return False
+            else:
+                # Arg not provided, but will be defaulted when called
+                # Default should not be type-checked
+                continue
+
+            if param_type is not self.undefined and not isinstance(value, param_type):
+                # Arg is not of expected type
+                return False
+
+        # validate remaining varargs/-kwargs
+        vararg_index = -1
+        to_verify: List[Tuple[str, Iterable]] = []
+        if self._callable.__code__.co_flags & 0x08:
+            to_verify.append((self._callable.__code__.co_varnames[vararg_index], kwargs.values()))
+            vararg_index = -2
+        elif _kw:
+            # Varkwargs where none expected
+            return False
+        if self._callable.__code__.co_flags & 0x04:
+            to_verify.append((self._callable.__code__.co_varnames[vararg_index], args))
+        elif _args:
+            # Varargs where none expected
+            return False
+        for vararg_name, values in to_verify:
+            param_type = self._get_param_type(vararg_name)
+            if param_type is not self.undefined and not all(
+                isinstance(v, param_type) for v in values
+            ):
+                # Varargs/-kwargs of unexpected types are present
+                return False
+
+        return True
+
 
 def overload(callable):
     '''Allow overloading of a callable.
@@ -107,90 +227,29 @@ def overload(callable):
     Invoke the result of this call with .add() to add additional
     implementations.
     '''
-    implementations: List[Tuple] = []
+    definitions: List[Signature] = []
 
     @functools.wraps(callable)
-    def f(*args, **kw):
-        for definition, implementation, skip_first_arg in implementations:
-            # duplicate the arguments provided so we may consume them
-            _args = list(args)
-            _kw = dict(kw)
-
-            default_count = len(definition.__defaults__) if definition.__defaults__ else 0
-            first_default_index = definition.__code__.co_argcount - default_count
-            usable_args = []
-            for n in range(definition.__code__.co_argcount):
-                arg = definition.__code__.co_varnames[n]
-                default_index = n - first_default_index
-
-                # unlike instance methods, class methods don't appear
-                # to have the class passed in as the first arg, so skip
-                # filling the first argument
-                if n == 0 and skip_first_arg:
-                    continue
-
-                # attempt to fill this argument
-                if _args:
-                    value = _args.pop(0)
-                elif arg in _kw:
-                    value = _kw.pop(arg)
-                elif default_index >= 0:
-                    value = definition.__defaults__[default_index]
-                else:
-                    break
-
-                # check annotation if it's a type
-                ann = definition.__annotations__.get(arg)
-                if isinstance(ann, type) and not isinstance(value, ann):
-                    break
-
-                usable_args.append(value)
-            else:
-                # check whether any supplied arguments remain
-                if _args:
-                    if  definition.__code__.co_flags & 0x04:
-                        # use as varargs
-                        usable_args.extend(_args)
-                    else:
-                        continue
-                if _kw:
-                    # use as arbitrary keyword args?
-                    if not definition.__code__.co_flags & 0x08:
-                        continue
-
+    def multiple_dispatch(*args, **kwargs):
+        for definition in definitions:
+            if definition.validate(*args, **kwargs):
                 # attempt to invoke the callable
-                return implementation(*usable_args, **_kw)
+                try:
+                    return definition.implementation(*args, **kwargs)
+                except (TypeError, ValueError) as e:
+                    continue
 
         # this error message probably can't get any better :-)
         raise TypeError('invalid call argument(s)')
 
     # allow adding of additional implementations
     def add(callable):
-        skip_first_arg = isinstance(callable, classmethod)
+        definitions.append(Signature(callable))
+        return multiple_dispatch
+    multiple_dispatch.add = add
 
-        # if the callable is a class then look for __new__ variations
-        if isinstance(callable, type):
-            # sanity check
-            if not isinstance(callable.__new__, types.FunctionType):
-                raise TypeError('overloaded class requires __new__ implementation')
-            definition = callable.__new__
-            implementation = callable
-            skip_first_arg = True
-        elif isinstance(callable, classmethod) or isinstance(callable, staticmethod):
-            # actually call the method underlying the classmethod directly - the proxyish
-            # object we've received as callable has the class first param filled in...
-            definition = implementation = callable.__get__(callable.__class__)
-        else:
-            definition = implementation = callable
-
-        implementations.append((definition, implementation, skip_first_arg))
-
-        return f
-    f.add = add
-
-    f.add(callable)
-
-    return f
+    multiple_dispatch.add(callable)
+    return multiple_dispatch
 
 
 class TestOverload(unittest.TestCase):
@@ -316,6 +375,23 @@ class TestOverload(unittest.TestCase):
         self.assertEqual(func(1), 'a')
         self.assertEqual(func(1, 2), '*args 2')
 
+    def test_varargs_types(self):
+        @overload
+        def func(*args: int):
+            return 'int'
+
+        @func.add
+        def func(*args: str):
+            return 'str'
+
+        @func.add
+        def func(*args):
+            return 'any'
+
+        self.assertEqual(func(1), 'int')
+        self.assertEqual(func('1', '2'), 'str')
+        self.assertEqual(func(1, '2'), 'any')
+
     def test_varargs_mixed(self):
         @overload
         def func(a):
@@ -341,6 +417,23 @@ class TestOverload(unittest.TestCase):
         self.assertEqual(func(1), 'a')
         self.assertEqual(func(a=1), 'a')
         self.assertEqual(func(a=1, b=2), '**kw 2')
+
+    def test_kw_types(self):
+        @overload
+        def func(**kw: int):
+            return 'int'
+
+        @func.add
+        def func(**kw: str):
+            return 'str'
+
+        @func.add
+        def func(**kw):
+            return 'any'
+
+        self.assertEqual(func(a=1), 'int')
+        self.assertEqual(func(b='1', a='2'), 'str')
+        self.assertEqual(func(b=1, a='2'), 'any')
 
     def test_kw_mixed(self):
         @overload
