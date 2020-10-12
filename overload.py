@@ -85,6 +85,7 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 1.4.0 Support overloading classes with __init__ methods but no __new__
 - 1.3.1 Improve type annotation support with stringed types and forward
         references.
 - 1.3.0 Add support for positional- and keyword-only arguments.
@@ -134,9 +135,12 @@ class Signature:
         # if the callable is a class then look for __new__ variations
         if isinstance(f, type):
             # sanity check
-            if not isinstance(f.__new__, types.FunctionType):
-                raise TypeError('overloaded class requires __new__ implementation')
-            self._callable = f.__new__
+            if isinstance(f.__new__, types.FunctionType):
+                self._callable = f.__new__
+            elif isinstance(f.__init__, types.FunctionType):
+                self._callable = f.__init__
+            else:
+                raise TypeError('overloaded class requires __new__ or __init__ implementation')
             self._skip_first_arg = True
         elif isinstance(f, classmethod) or isinstance(f, staticmethod):
             # actually call the method underlying the classmethod directly - the proxyish
