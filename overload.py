@@ -85,6 +85,7 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 1.4.1 Fix mypy errors
 - 1.4.0 Support overloading classes with __init__ methods but no __new__
 - 1.3.1 Improve type annotation support with stringed types and forward
         references.
@@ -103,12 +104,12 @@ Version History (in Brief)
 
 See the end of the source file for the license of use.
 '''
-__version__ = '1.1'
+__version__ = '1.4.1'
 
 import functools
 import types
 import unittest
-from typing import get_type_hints, Any, Callable, List, Sequence, Tuple, Union
+from typing import get_type_hints, Any, Callable, Dict, Iterable, List, Sequence, Tuple, Union
 
 
 class _Undefined:
@@ -123,16 +124,16 @@ _PositionalParamDefinition = Tuple[int, str, _ParamAnnotatedType, Any]
 _KeywordParamDefinition = Tuple[str, _ParamAnnotatedType, Any]
 
 
-class Signature:
-    '''Wraps a callable to directly expose its signature.'''
+class _Signature:
+    '''Wraps a callable to validate arguments against its signature.'''
     undefined = _Undefined()
 
-    def __init__(self, f: Callable, /):
-        self._callable: Callable = f
-        self.implementation: Callable = f
+    def __init__(self, f, /):
+        self._callable = f
+        self.implementation = f
         self._skip_first_arg: bool = isinstance(f, classmethod)
 
-        # if the callable is a class then look for __new__ variations
+        # if the callable is a class then look for __new__ or __init__ variations
         if isinstance(f, type):
             # sanity check
             if isinstance(f.__new__, types.FunctionType):
@@ -231,7 +232,7 @@ class Signature:
                 # Default should not be type-checked
                 continue
 
-            if param_type is not self.undefined and not isinstance(value, param_type):
+            if not (isinstance(param_type, _Undefined) or isinstance(value, param_type)):
                 # Arg is not of expected type
                 return False
 
@@ -239,7 +240,7 @@ class Signature:
         for param, param_type, default in self._keyword_only_parameters:
             if param in _kw:
                 value = _kw.pop(param)
-                if param_type is not self.undefined and not isinstance(value, param_type):
+                if not (isinstance(param_type, _Undefined) or isinstance(value, param_type)):
                     # Keyword-only arg is not of expected type
                     return False
             elif default is self.undefined:
@@ -262,8 +263,8 @@ class Signature:
             return False
         for vararg_name, values in to_verify:
             param_type = self._get_param_type(vararg_name)
-            if param_type is not self.undefined and not all(
-                isinstance(v, param_type) for v in values
+            if not (
+                isinstance(param_type, _Undefined) or all(isinstance(v, param_type) for v in values)
             ):
                 # Varargs/-kwargs of unexpected types are present
                 return False
@@ -277,7 +278,7 @@ def overload(callable):
     Invoke the result of this call with .add() to add additional
     implementations.
     '''
-    definitions: List[Signature] = []
+    definitions: List[_Signature] = []
 
     @functools.wraps(callable)
     def multiple_dispatch(*args, **kwargs):
@@ -294,7 +295,7 @@ def overload(callable):
 
     # allow adding of additional implementations
     def add(callable):
-        definitions.append(Signature(callable))
+        definitions.append(_Signature(callable))
         return multiple_dispatch
     multiple_dispatch.add = add
 
