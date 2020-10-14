@@ -53,6 +53,61 @@ The docstring and name (ie. documentation) of the resultant callable will
 match that of the *first* callable overloaded.
 
 
+typing.overload Compatibility
+-----------------------------
+
+Alternatively, starting with v2.0.0, you can use the decorator in this
+module in the same way as `typing.overload` from the standard library, but
+providing the implementations alongside the correct signature:
+
+>>> from typing import overload
+>>> from overload import call_multiple_dispatcher, overload
+>>> class A(object):
+...   @overload
+...   def method(self, a: int):
+...     return 'int'
+...   @overload
+...   def method(self, a: str):
+...     return 'str'
+...   @wrap_overloaded_as
+...   def method(self, *args, **kwargs):
+...     """Report if a is string or integer"""
+... 
+>>> a = A()
+>>> a.method(1)
+'int'
+>>> a.method('s')
+'str'
+>>> a.method(1.0)
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "overload.py", line 94, in f
+    raise TypeError('invalid call argument(s)')
+TypeError: invalid call argument(s)
+
+The final definition is not needed by this module, but is a requirement of
+mypy when using `typing.overload`.  Furthermore, the association of that
+final definition's docstring with the overloaded function, as per the
+`typing.overload` conventions described in PEP 484, conflicts with the default
+behaviour of `overload.overload`, where the docstring used is that of the
+_first_ of the overloaded functions' docstrings.
+
+`@wrap_overloaded_as` is a convenience decorator to support the
+`typing.overload` requirements in a standardised way without sacrificing
+either readability of the behaviour of this module's version of the decorator.
+`wrap_overloaded_as` returns the multiple-dispatcher function for the
+overloaded method of the same fully qualified name, and treats it as the
+"wrapper" for the decorated function (taking many of it's attributes,
+including name and docstring, as per `functools.wraps()`).
+
+NB: Please note that MyPy overloaded type checking is based on static analysis
+of the code, and requires `typing.overload` to be imported to accept `@overload`ed
+definitions of functions.  However, it doesn't matter to the type-checker if
+the `overload` decorator is then replaced within the namespace prior to being
+used to decorate any overloaded methods.  That is how the above code snippet
+works in both contexts.
+
+
 Overloading Classes
 --------------------
 
@@ -85,6 +140,8 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 2.0.0 Support interplay with typing.overload, for mypy type checking and IDE
+        integration.
 - 1.4.2 Support complex type checking (e.g. Union types)
 - 1.4.1 Fix mypy errors
 - 1.4.0 Support overloading classes with __init__ methods but no __new__
@@ -105,7 +162,7 @@ Version History (in Brief)
 
 See the end of the source file for the license of use.
 '''
-__version__ = '1.4.1'
+__version__ = '2.0.0'
 
 import functools
 import types
@@ -221,6 +278,10 @@ class _Signature:
             for param in self._callable.__code__.co_varnames[keyword_only_parameters_slice]
         )
 
+    @property
+    def fully_qualified_name(self):
+        return f"{self.implementation.__module__}.{self.implementation.__qualname__}"
+
     def validate(self, *args, **kwargs) -> bool:
         # duplicate the arguments provided so we may consume them
         _args = list(args)
@@ -287,35 +348,65 @@ class _Signature:
         return True
 
 
-def overload(callable):
+_overload_register: Dict[str, Tuple[Callable, List[_Signature]]] = {}
+
+
+def overload(original_callable):
     '''Allow overloading of a callable.
 
     Invoke the result of this call with .add() to add additional
     implementations.
     '''
-    definitions: List[_Signature] = []
+    definition = _Signature(original_callable)
 
-    @functools.wraps(callable)
-    def multiple_dispatch(*args, **kwargs):
-        for definition in definitions:
-            if definition.validate(*args, **kwargs):
-                # attempt to invoke the callable
-                try:
-                    return definition.implementation(*args, **kwargs)
-                except (TypeError, ValueError) as e:
-                    continue
+    definitions: List[_Signature]
+    multiple_dispatch = Callable
 
-        # this error message probably can't get any better :-)
-        raise TypeError('invalid call argument(s)')
+    overload_key = definition.fully_qualified_name
+    if overload_key in _overload_register:
+        multiple_dispatch, definitions = _overload_register[overload_key]
+        definitions.append(definition)
+    else:
+        definitions = [definition]
 
-    # allow adding of additional implementations
-    def add(callable):
-        definitions.append(_Signature(callable))
-        return multiple_dispatch
-    multiple_dispatch.add = add
+        def multiple_dispatch(*args, **kwargs):
+            for definition in definitions:
+                if definition.validate(*args, **kwargs):
+                    # attempt to invoke the callable
+                    try:
+                        return definition.implementation(*args, **kwargs)
+                    except (TypeError, ValueError) as e:
+                        continue
 
-    multiple_dispatch.add(callable)
-    return multiple_dispatch
+            # this error message probably can't get any better :-)
+            raise TypeError('invalid call argument(s)')
+
+        def add(other_callable=None, *, definition: Optional[_Signature] = None):
+            if other_callable:
+                definitions.append(_Signature(other_callable))
+            elif definition:
+                definitions.append(definition)
+            else:
+                raise TypeError(
+                    "Expected either callable positional argument or 'definition' keyword argument"
+                )
+            return functools.wraps(original_callable)(multiple_dispatch)
+
+        multiple_dispatch.add = add
+
+        _overload_register[overload_key] = multiple_dispatch, definitions
+
+    return functools.wraps(original_callable)(multiple_dispatch)
+
+
+def wrap_overloaded_as(callable):
+    definition = _Signature(callable)
+    overload_key = definition.fully_qualified_name
+    try:
+        multiple_dispatch, _ = _overload_register[overload_key]
+    except KeyError:
+        raise TypeError("Can only wrap a previously-overloaded function/method")
+    return functools.wraps(callable)(multiple_dispatch)
 
 
 class TestOverload(unittest.TestCase):
@@ -570,11 +661,346 @@ class TestOverload(unittest.TestCase):
         self.assertEqual(func(a=1), 'a')
         self.assertEqual(func(a=4, c=5, d=0), 'a 4, b 2, c 5, **kw 1')
 
+
+class TestOverloadMyPyIntegration(unittest.TestCase):
+    def test_wrapping(self):
+        'check that we generate a nicely-wrapped result'
+        @overload
+        def func(arg):
+            'doc'
+            pass
+        @overload
+        def func(*args):
+            'doc2'
+            pass
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc3'
+        self.assertEqual(func.__doc__, 'doc3')
+
+    def test_method(self):
+        'check we can overload instance methods'
+        class A:
+            @overload
+            def method(self):
+                return 'ok'
+            @overload
+            def method(self, *args):
+                return 'args'
+            @wrap_overloaded_as
+            def method(self, *args, **kwargs):
+                'doc'
+        self.assertEqual(A().method(), 'ok')
+        self.assertEqual(A().method(1), 'args')
+
+    def test_classmethod(self):
+        'check we can overload classmethods'
+        class A:
+            @overload
+            @classmethod
+            def method(cls):
+                return 'ok'
+            @overload
+            @classmethod
+            def method(cls, *args):
+                return 'args'
+            @wrap_overloaded_as
+            @classmethod
+            def method(cls, *args, **kwargs):
+                'doc'
+        self.assertEqual(A.method(), 'ok')
+        self.assertEqual(A.method(1), 'args')
+
+    def test_staticmethod(self):
+        'check we can overload staticmethods'
+        class A:
+            @overload
+            @staticmethod
+            def method():
+                return 'ok'
+            @method.add
+            @staticmethod
+            def method(*args):
+                return 'args'
+            @wrap_overloaded_as
+            @staticmethod
+            def method(cls, *args, **kwargs):
+                'doc'
+        self.assertEqual(A.method(), 'ok')
+        self.assertEqual(A.method(1), 'args')
+
+    def test_class(self):
+        @overload
+        class A(object):
+            first = True
+            def __new__(cls):
+                # must explicitly reference the base class
+                return object.__new__(cls)
+
+        @overload
+        class A(object):
+            first = False
+            def __new__(cls, a):
+                # must explicitly reference the base class
+                return object.__new__(cls)
+
+        @wrap_overloaded_as
+        class A(object):
+            'doc'
+            def __new__(cls):
+                pass
+
+        self.assertEqual(A().first, True)
+        self.assertEqual(A(1).first, False)
+
+    def test_arg_pattern(self):
+        @overload
+        def func(a):
+            return 'with a'
+
+        @overload
+        def func(a, b):
+            return 'with a and b'
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func('a'), 'with a')
+        self.assertEqual(func('a', 'b'), 'with a and b')
+        self.assertRaises(TypeError, func)
+        self.assertRaises(TypeError, func, 'a', 'b', 'c')
+        self.assertRaises(TypeError, func, b=1)
+
+    def test_positional_only_args(self):
+        @overload
+        def func(a, /, b):
+            return 'with b and positional-only a'
+
+        @overload
+        def func(a, b):
+            return 'with a and b'
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func('a', b='b'), 'with b and positional-only a')
+        self.assertEqual(func(a='a', b='b'), 'with a and b')
+
+    def test_overload_independent(self):
+        class A(object):
+            @overload
+            def method(self):
+                return 'a'
+            @overload
+            def method(self, a):
+                return 'a2'
+            @wrap_overloaded_as
+            def method(self, *args, **kwargs):
+                'doc A'
+
+        class B(object):
+            @overload
+            def method(self):
+                return 'b'
+            @overload
+            def method(self, b):
+                return 'b2'
+            @wrap_overloaded_as
+            def method(self, *args, **kwargs):
+                'doc B'
+
+        self.assertEqual(A().method(), 'a')
+        self.assertEqual(B().method(), 'b')
+
+    def test_arg_types(self):
+        @overload
+        def func(a:int):
+            return 'int'
+
+        @overload
+        def func(a:str):
+            return 'str'
+
+        @overload
+        def func(a:Union[dict, list]):
+            return 'dict or list'
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'int')
+        self.assertEqual(func('1'), 'str')
+        self.assertEqual(func({}), 'dict or list')
+        self.assertRaises(TypeError, func, ())
+
+    def test_varargs(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @overload
+        def func(*args):
+            return '*args {}'.format(len(args))
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(1, 2), '*args 2')
+
+    def test_varargs_types(self):
+        @overload
+        def func(*args: int):
+            return 'int'
+
+        @overload
+        def func(*args: str):
+            return 'str'
+
+        @overload
+        def func(*args):
+            return 'any'
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'int')
+        self.assertEqual(func('1', '2'), 'str')
+        self.assertEqual(func(1, '2'), 'any')
+
+    def test_varargs_mixed(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @overload
+        def func(a, *args):
+            return '*args {}'.format(len(args))
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(1, 2), '*args 1')
+        self.assertEqual(func(1, 2, 3), '*args 2')
+
+    def test_kw(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @overload
+        def func(**kw):
+            return '**kw {}'.format(len(kw))
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(a=1), 'a')
+        self.assertEqual(func(a=1, b=2), '**kw 2')
+
+    def test_kw_only_args(self):
+        @overload
+        def func(a, *, b):
+            return 'with a and keyword only b'
+
+        @overload
+        def func(a, b):
+            return 'with a and b'
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1, 2), 'with a and b')
+        self.assertEqual(func(a=1, b=2), 'with a and keyword only b')
+
+    def test_kw_types(self):
+        @overload
+        def func(**kw: int):
+            return 'int'
+
+        @overload
+        def func(**kw: str):
+            return 'str'
+
+        @overload
+        def func(**kw):
+            return 'any'
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(a=1), 'int')
+        self.assertEqual(func(b='1', a='2'), 'str')
+        self.assertEqual(func(b=1, a='2'), 'any')
+
+    def test_kw_mixed(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @overload
+        def func(a, **kw):
+            return '**kw {}'.format(len(kw))
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(a=1), 'a')
+        self.assertEqual(func(a=1, b=2), '**kw 1')
+
+    def test_kw_mixed2(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @overload
+        def func(c=1, **kw):
+            return '**kw {}'.format(len(kw))
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(a=1), 'a')
+        self.assertEqual(func(c=1, a=2), '**kw 1')
+
+    def test_kw_mixed3(self):
+        @overload
+        def func(a):
+            return 'a'
+
+        @overload
+        def func(a=1, b=2, c=3, **kw):
+            return 'a {a}, b {b}, c {c}, **kw {count}'.format(a=a, b=b, c=c, count=len(kw))
+
+        @wrap_overloaded_as
+        def func(*args, **kwargs):
+            'doc'
+
+        self.assertEqual(func(1), 'a')
+        self.assertEqual(func(a=1), 'a')
+        self.assertEqual(func(a=4, c=5, d=0), 'a 4, b 2, c 5, **kw 1')
+
 if __name__ == '__main__':
     unittest.main()
 
 
 # Copyright (c) 2011 Richard Jones <richard@mechanicalcat.net>
+# Copyright (c) 2020 David Monks <david.monks@zepler.net>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -583,7 +1009,7 @@ if __name__ == '__main__':
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
-#  The above copyright notice and this permission notice shall be included in
+#  The above copyright notices and this permission notice shall be included in
 #  all copies or substantial portions of the Software.
 #
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
