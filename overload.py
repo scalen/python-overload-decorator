@@ -85,6 +85,7 @@ classes.
 Version History (in Brief)
 --------------------------
 
+- 1.4.2 Support complex type checking (e.g. Union types)
 - 1.4.1 Fix mypy errors
 - 1.4.0 Support overloading classes with __init__ methods but no __new__
 - 1.3.1 Improve type annotation support with stringed types and forward
@@ -109,7 +110,19 @@ __version__ = '1.4.1'
 import functools
 import types
 import unittest
-from typing import get_type_hints, Any, Callable, Dict, Iterable, List, Sequence, Tuple, Union
+from typing import (
+    get_args,
+    get_type_hints,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 
 class _Undefined:
@@ -119,7 +132,7 @@ class _Undefined:
         return False
 
 
-_ParamAnnotatedType = Union[type, _Undefined]
+_ParamAnnotatedType = Union[type, Tuple[type, ...], _Undefined]
 _PositionalParamDefinition = Tuple[int, str, _ParamAnnotatedType, Any]
 _KeywordParamDefinition = Tuple[str, _ParamAnnotatedType, Any]
 
@@ -149,11 +162,13 @@ class _Signature:
             self._callable = self.implementation = f.__get__(f.__class__)
 
     def _get_param_type(self, param: str) -> _ParamAnnotatedType:
-        annotations = get_type_hints(self._callable)
-        if param not in annotations:
+        type_hints = get_type_hints(self._callable)
+        if param not in type_hints:
             return self.undefined
-        annotation = annotations[param]
-        return annotation if isinstance(annotation, type) else self.undefined
+        type_hint = type_hints[param]
+        # To support Union and other complex type structures
+        type_arguments = get_args(type_hint)
+        return type_arguments if type_arguments else type_hint
 
     def _get_positional_default(self, position: int) -> Any:
         if not self._callable.__defaults__:
@@ -430,6 +445,7 @@ class TestOverload(unittest.TestCase):
         self.assertEqual(func(1), 'int')
         self.assertEqual(func('1'), 'str')
         self.assertEqual(func({}), 'dict or list')
+        self.assertRaises(TypeError, func, ())
 
     def test_varargs(self):
         @overload
